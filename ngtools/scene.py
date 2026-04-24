@@ -34,6 +34,12 @@ from ngtools.shaders import colormaps, load_fs_lut, rotate_shader, shaders
 from ngtools.units import convert_unit
 from ngtools.utils import NG_URLS, Wraps
 
+from ngtools.local.zarrvectors import (
+    expand_zarrvectors_url,
+    register_array_usage,
+    unregister_array_usage,
+)
+
 # monkey-patch Layer state to expose channelDimensions
 if not hasattr(ng.Layer, "channelDimensions"):
     ng.Layer.channel_dimensions \
@@ -497,6 +503,12 @@ class Scene(ViewerState):
             * If "debug":   print errors, warnings, infos and debug messages.
             * If "any:      print any message.
         """
+
+        # Maps layer_name -> (store_path, array_name) for zv-registered layers.
+        # Used by unload() to call unregister_array_usage with the right key,
+        # and by the reload shell command to find which array to flush.
+        self._zv_layer_cache_identities = {}
+
         stdio = kwargs.pop("stdio", None)
         if stdio is None:
             stdin = kwargs.pop("stdout", sys.stdin)
@@ -565,8 +577,39 @@ class Scene(ViewerState):
         for n, uri in enumerate(uris):
 
             # TODO: wrap each file loading in a try/except block?
-
             uri = str(uri).rstrip("/")
+
+            # --- zarrvectors dispatch -----------------------------------
+            if isinstance(uri, str) and uri.startswith("zarrvectors://"):
+
+                # sanity check
+                if not fileserver:
+                    raise ValueError("Cannot load zarrvectors:// URLs without a fileserver")
+
+                # resolve fileserver base the same way local files do
+                fileserver_base = fileserver  # already derived at top of load()
+                specs = expand_zarrvectors_url(uri, fileserver_base)
+
+                for spec in specs:
+                    name = spec["name"]
+
+                    # register usage for cache lifecycle
+                    _, store_path, array_name = spec["_cache_identity"]
+                    register_array_usage(store_path, array_name)
+
+                    # track identity for unload()
+                    self._zv_layer_cache_identities[name] = (
+                        store_path, array_name
+                    )
+
+                    # create layer
+                    self._register_zv_layer(spec)
+
+                    onames.append(name)
+
+                continue  # skip normal loading path
+            # --------------------------------------------------------
+
             parsed = parse_protocols(uri)
             short_uri = parsed.url
             basename = op.basename(short_uri)
@@ -645,6 +688,13 @@ class Scene(ViewerState):
         """
         layers = layer or [layer.name for layer in self.layers]
         for name in _ensure_list(layers):
+
+            # --- NEW: zarrvectors refcount handling --------------------------
+            if name in self._zv_layer_cache_identities:
+                store_path, array_name = self._zv_layer_cache_identities.pop(name)
+                unregister_array_usage(store_path, array_name)
+            # --- END NEW -----------------------------------------------------
+
             del self.layers[name]
 
     @autolog
@@ -663,6 +713,10 @@ class Scene(ViewerState):
             layer: ng.ManagedLayer
             if layer.name == src:
                 layer.name = dst
+                # Keep zv identity tracking in sync
+                if src in self._zv_layer_cache_identities:
+                    self._zv_layer_cache_identities[dst] = \
+                        self._zv_layer_cache_identities.pop(src)
                 return
         raise ValueError('No layer named', src)
 
@@ -2606,3 +2660,42 @@ class Scene(ViewerState):
             self.stdio.info(state)
 
         return json_state
+
+
+    def _register_zv_layer(self, spec: dict) -> None:
+        """Register one zarrvectors spec as a Neuroglancer layer."""
+        name = spec["name"]
+        source_url = spec["source_url"]
+        layer_type = spec["layer_type"]   # "annotation" | "mesh"
+        affine = spec["affine"]           # (4,4) numpy array
+
+        # Neuroglancer expects 3x4
+        matrix = affine[:3]
+
+        transform = ng.CoordinateSpaceTransform(
+            matrix=matrix,
+            input_dimensions=S.neurospaces["xyz"],
+            output_dimensions=S.neurospaces["xyz"],
+        )
+
+        if layer_type == "annotation":
+            layer = ng.AnnotationLayer(
+                source=ng.LayerDataSource(
+                    url=source_url,
+                    transform=transform,
+                )
+            )
+
+        elif layer_type == "mesh":
+            layer = ng.SegmentationLayer(
+                source=ng.LayerDataSource(
+                    url=source_url,
+                    transform=transform,
+                )
+            )
+
+        else:
+            raise ValueError(f"Unknown layer_type: {layer_type}")
+
+        self.layers.append(name=name, layer=layer)
+        self.stdio.info(f"Loaded (zarrvectors): {name}")

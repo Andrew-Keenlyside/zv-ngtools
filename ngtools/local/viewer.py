@@ -28,6 +28,14 @@ from ngtools.scene import Scene
 from ngtools.shaders import pretty_colormap_list
 from ngtools.utils import _IS_GOOGLE_COLAB, NG_URLS, find_available_port
 
+from ngtools.local.zarrvectors import (
+    ZarrVectorsStreamlineHandler,
+    ZarrVectorsPointHandler,
+    ZarrVectorsMeshHandler,
+    reload_zv_array,
+    reload_all_zv_caches,
+)
+
 # unix-specific imports
 try:
     import grp
@@ -299,6 +307,9 @@ class LocalNeuroglancer(OSMixin):
                 (r"^/local/(.*)", StaticFileHandler),
                 (r"^/lut/([^/]+)/(.*)", LutHandler),
                 (r"^/linc/(.*)", LincHandler),
+                (r"^/zv/streamlines/(.*)", ZarrVectorsStreamlineHandler),
+                (r"^/zv/points/(.*)", ZarrVectorsPointHandler),
+                (r"^/zv/mesh/(.*)", ZarrVectorsMeshHandler),
             ])
         self.fileserver = fileserver
 
@@ -732,6 +743,21 @@ class LocalNeuroglancer(OSMixin):
             help='Name(s) of layer(s) to unload')
 
         # --------------------------------------------------------------
+        #   RELOAD ZARRVECTORS
+        # --------------------------------------------------------------
+        _ = add_parser(
+            'reload_zv',
+            help='Flush zarr-vectors caches for a layer (or all)'
+        )
+        _.set_defaults(func=self.reload_zv)
+        _.add_argument(
+            'layer',
+            nargs='?',
+            default=None,
+            help='Layer name; omit to reload all zv caches'
+        )
+
+        # --------------------------------------------------------------
         #   RENAME
         # --------------------------------------------------------------
         _ = add_parser('rename', help='Rename a file')
@@ -1081,6 +1107,26 @@ class LocalNeuroglancer(OSMixin):
             self.console.parse_args([action, '--help'])
         else:
             self.console.parse_args(['--help'])
+
+    @action
+    def reload_zv(self, layer: str | None = None) -> str:
+        """Flush zarr-vectors caches for a layer (or all)."""
+
+        with self.scene() as scene:
+
+            if layer is None:
+                reload_all_zv_caches()
+                return "Reloaded all zarr-vectors caches"
+
+            identity = scene._zv_layer_cache_identities.get(layer)
+
+            if identity is None:
+                return f"Layer {layer!r} is not a zarr-vectors layer"
+
+            store_path, array_name = identity
+            reload_zv_array(store_path, array_name)
+
+            return f"Reloaded zarr-vectors layer {layer!r}"
 
     @action
     def exit(self) -> None:
