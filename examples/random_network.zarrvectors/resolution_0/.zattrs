@@ -1,0 +1,16 @@
+{
+  "zarr_vectors_level": {
+    "level": 0,
+    "bin_shape": null,
+    "bin_ratio": null,
+    "object_sparsity": 1.0,
+    "vertex_count": 1000,
+    "coarsening_method": "none",
+    "parent_level": null,
+    "arrays_present": [
+      "vertices",
+      "links",
+      "object_index"
+    ]
+  }
+}

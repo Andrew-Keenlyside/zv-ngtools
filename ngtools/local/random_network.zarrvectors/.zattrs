@@ -1,0 +1,52 @@
+{
+  "zarr_vectors": {
+    "format_version": "0.2",
+    "spatial_index_dims": [
+      {
+        "name": "dim0",
+        "type": "space",
+        "unit": "unit"
+      },
+      {
+        "name": "dim1",
+        "type": "space",
+        "unit": "unit"
+      },
+      {
+        "name": "dim2",
+        "type": "space",
+        "unit": "unit"
+      }
+    ],
+    "chunk_shape": [
+      100.0,
+      100.0,
+      100.0
+    ],
+    "bounds": [
+      [
+        0.04720982909202576,
+        0.10879628360271454,
+        0.013168556615710258
+      ],
+      [
+        999.97705078125,
+        999.9824829101562,
+        999.947265625
+      ]
+    ],
+    "geometry_types": [
+      "graph"
+    ],
+    "crs": null,
+    "links_convention": "explicit",
+    "object_index_convention": "standard",
+    "cross_chunk_strategy": "explicit_links",
+    "reduction_factor": 8,
+    "base_bin_shape": [
+      25.0,
+      25.0,
+      25.0
+    ]
+  }
+}

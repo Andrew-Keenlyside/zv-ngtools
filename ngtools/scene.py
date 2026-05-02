@@ -2697,5 +2697,15 @@ class Scene(ViewerState):
         else:
             raise ValueError(f"Unknown layer_type: {layer_type}")
 
+        # === SLAB/CONE-VIEW SANDBOX BEGIN ====================================
+        # Apply the adapter's default shader, if any. Datatype-keyed in
+        # ngtools/local/zarrvectors.py (_DEFAULT_SHADERS_BY_DATATYPE). The
+        # user can override per layer via the Render tab without touching
+        # the package.
+        default_shader = spec.get("default_shader")
+        if default_shader is not None and hasattr(layer, "shader"):
+            layer.shader = default_shader
+        # === SLAB/CONE-VIEW SANDBOX END ======================================
+
         self.layers.append(name=name, layer=layer)
         self.stdio.info(f"Loaded (zarrvectors): {name}")

@@ -624,6 +624,614 @@ def _encode_annotation_properties(segment, properties_schema, order):
 
 
 # =============================================================================
+# Real zarr_vectors adapter
+# =============================================================================
+# The handler in this file talks to opaque "store" and "array" objects through
+# a documented contract (see _make_layer_spec, _build_info_raw, and the
+# read_bin / bin_size / grid_shape call sites). The real `zarr_vectors`
+# package exposes a different surface — one store per geometry type, with
+# reads via top-level functions like `read_chunk_vertices` and
+# `read_chunk_links`. This adapter wraps a `zarr_vectors.lazy.store.ZVRStore`
+# in the per-array contract the handler expects.
+#
+# Mapping from geometry_type to virtual arrays:
+#   graph / skeleton  ->  ("nodes", point) + ("edges", streamline)
+#   point_cloud       ->  ("points", point)
+#   line              ->  ("lines", streamline)
+#   polyline          ->  ("polylines", streamline; each polyline exploded
+#                          into N-1 two-point segments)
+#   mesh              ->  ("mesh", mesh)
+#
+# v1 limitations (handler has correct fallbacks for all of these):
+#  - Single resolution level only.
+#  - Spatial bins precomputed eagerly on first `read_bin` call. Memory is
+#    O(N + E); fine for the 10K-vertex notebook smoke test.
+#  - bounds[0] (the lower corner) is subtracted off positions so the
+#    handler's [0, voxel_extent] frame holds.
+#  - mtime/locate/limit_per_level not implemented; handler scans/builds
+#    on demand.
+
+class _Segment:
+    __slots__ = ("id", "prominence", "geometry", "properties", "relationships")
+
+    def __init__(self, id, geometry, prominence=0, properties=None, relationships=None):
+        self.id = int(id)
+        self.geometry = geometry
+        self.prominence = int(prominence)
+        self.properties = properties if properties is not None else {}
+        self.relationships = relationships if relationships is not None else {}
+
+
+class _MeshObj:
+    __slots__ = ("vertices", "indices")
+
+    def __init__(self, vertices, indices):
+        self.vertices = vertices
+        self.indices = indices
+
+
+def _voxel_extent_from_bounds(bounds):
+    import math as _math
+    bmax = bounds[1]
+    return tuple(int(_math.ceil(float(v))) for v in bmax)
+
+
+_POSITION_PROPERTIES = [
+    {"id": "x", "type": "float32"},
+    {"id": "y", "type": "float32"},
+    {"id": "z", "type": "float32"},
+]
+
+
+# === SLAB/CONE-VIEW SANDBOX BEGIN ============================================
+# Deterministic hash-based decimation. `_level_keep(seg_id, K)` is True for
+# ~1/2^K of all seg_ids. Used by the 8 LOD-pinned virtual arrays
+# (nodes_lod0..3, edges_lod0..3) so Neuroglancer's notebook-side cursor-LOD
+# shader can render a different decimation tier in each cursor-distance ring.
+def _level_keep(seg_id: int, level: int) -> bool:
+    if level <= 0:
+        return True
+    stride = 1 << int(level)
+    return ((int(seg_id) * 2654435761) & 0xFFFFFFFF) % stride == 0
+
+
+# Default annotation shader applied to every zarrvectors:// layer at load
+# time (see scene.py _register_zv_layer). Reads the per-annotation x/y/z
+# properties published above (_POSITION_PROPERTIES) and uses
+# uModelViewProjection to fade items by signed distance from the slice
+# plane in cross-section panels. The 3D panel is unaffected.
+#
+# Sliders exposed in the layer's Render tab:
+#   clip_sign      ±1  - flip if your build's depth sign convention
+#                        is reversed (camera-side vs far-side swap).
+#   fade_in_front  NDC - fade ramp width in front of the slice (0.05..10);
+#                        with cross_section_depth ~ 2*volume_radius, NDC
+#                        1.0 corresponds to ~ volume_radius voxels.
+#   fade_behind    NDC - fade ramp width behind the slice. Set to ~10
+#                        to effectively disable fade on that side.
+_SHADER_HEAD = """
+#uicontrol float clip_sign     slider(min=-1.0, max=1.0,  default=1.0, step=2.0)
+#uicontrol float fade_in_front slider(min=0.05, max=10.0, default=0.6, step=0.05)
+#uicontrol float fade_behind   slider(min=0.05, max=10.0, default=10.0, step=0.05)
+"""
+
+_SHADER_DEPTH_FADE = """
+    if (!PROJECTION_VIEW) {
+      vec4 clip = uModelViewProjection * vec4(p, 1.0);
+      float depth = clip_sign * (clip.z / max(clip.w, 1e-6));
+      if (depth >= 0.0) {
+        fade = 1.0 - smoothstep(0.0, fade_in_front, depth);
+      } else {
+        fade = 1.0 - smoothstep(0.0, fade_behind, -depth);
+      }
+      if (fade <= 0.0) discard;
+    }
+"""
+
+_DEFAULT_POINT_SHADER = _SHADER_HEAD + """
+#uicontrol float base_size slider(min=1.0, max=20.0, default=8.0)
+
+void main() {
+  vec3 p = vec3(prop_x(), prop_y(), prop_z());
+  float fade = 1.0;
+""" + _SHADER_DEPTH_FADE + """
+  setColor(vec4(defaultColor(), fade));
+  setPointMarkerSize(base_size * fade);
+}
+"""
+
+_DEFAULT_LINE_SHADER = _SHADER_HEAD + """
+#uicontrol float base_width slider(min=0.3, max=5.0, default=1.5)
+
+void main() {
+  vec3 p = vec3(prop_x(), prop_y(), prop_z());
+  float fade = 1.0;
+""" + _SHADER_DEPTH_FADE + """
+  setColor(vec4(defaultColor(), fade));
+  setLineWidth(base_width * fade);
+}
+"""
+
+_DEFAULT_SHADERS_BY_DATATYPE = {
+    "point":      _DEFAULT_POINT_SHADER,
+    "streamline": _DEFAULT_LINE_SHADER,
+    # mesh layers go through SegmentationLayer's mesh-shader pipeline,
+    # which is not the annotation shader DSL — no default published.
+    "mesh":       None,
+}
+# === SLAB/CONE-VIEW SANDBOX END ==============================================
+
+
+class _BaseArrayAdapter:
+    """Common metadata for annotation adapters (point / streamline).
+
+    Multi-level support: each level k uses bin shape = base_bin_shape * 2^k
+    (binning-only LOD; same segments at every level, just coarser bin grid).
+    Subclasses provide `_collect_segments()` returning a flat list of
+    _Segment records and `_segment_position(seg)` returning the (D,) point
+    used for binning (point coords for points, midpoint for streamlines).
+    """
+
+    LEVELS = 4
+
+    # === SLAB/CONE-VIEW SANDBOX BEGIN ============================================
+    # Per-annotation x/y/z properties published via the precomputed `info.properties`
+    # schema. Notebook-side annotation shaders can read them (`prop_x()` / `prop_y()`
+    # / `prop_z()`) to compute signed depth from the slice plane and clip the
+    # camera-side half. Cost: 12 extra bytes per segment in the wire format.
+    segment_properties = _POSITION_PROPERTIES
+    # === SLAB/CONE-VIEW SANDBOX END ==============================================
+
+    def __init__(self, zvr, level=0, pinned_level=None):
+        # === SLAB/CONE-VIEW SANDBOX BEGIN ========================================
+        # `pinned_level=K` collapses this adapter to a single LOD: it reports
+        # `levels = 1`, uses bin_shape = base * 2^K, and decimates segments by
+        # `_level_keep(seg.id, K)` (~1/2^K keep ratio). The notebook then loads
+        # 4 such pinned-level layers per geometry kind, masks each by a cursor-
+        # distance ring in the shader, and gets cursor-centred chunk-level LOD.
+        # === SLAB/CONE-VIEW SANDBOX END ==========================================
+        self._zvr = zvr
+        self._level_idx = level
+        self._pinned_level = pinned_level
+        self._root_meta = zvr._meta
+        self._ndim = zvr._meta.sid_ndim
+        self._bin_shape = tuple(float(b) for b in zvr._meta.effective_bin_shape)
+        self._chunk_shape = tuple(float(c) for c in zvr._meta.chunk_shape)
+        self._bins_per_chunk = zvr._meta.bins_per_chunk
+        self._bound_min = np.asarray(zvr._meta.bounds[0], dtype=np.float64)
+        self._voxel_extent = _voxel_extent_from_bounds(zvr._meta.bounds)
+        # Per-level state, populated lazily.
+        self._segments: list | None = None
+        self._bins_per_level: dict[int, dict] = {}
+        self._limits: list[int] | None = None
+
+    @property
+    def voxel_extent(self):
+        return self._voxel_extent
+
+    @property
+    def affine(self):
+        return np.eye(4, dtype=np.float64)
+
+    @property
+    def levels(self):
+        return 1 if self._pinned_level is not None else self.LEVELS
+
+    def _level_bin_shape(self, level):
+        # When pinned, every level in this adapter (only level 0 exists) maps to
+        # the pinned source level's bin shape.
+        src = self._pinned_level if self._pinned_level is not None else int(level)
+        scale = 2 ** int(src)
+        return tuple(b * scale for b in self._bin_shape)
+
+    def bin_size(self, level):
+        return tuple(int(round(b)) for b in self._level_bin_shape(level))
+
+    def grid_shape(self, level):
+        import math as _math
+        bs = self._level_bin_shape(level)
+        return tuple(
+            max(1, int(_math.ceil(self._voxel_extent[d] / bs[d])))
+            for d in range(self._ndim)
+        )
+
+    # --- subclass hooks ---
+    def _collect_segments(self):
+        raise NotImplementedError
+
+    def _segment_position(self, seg):
+        raise NotImplementedError
+
+    # --- shared bin/level machinery ---
+    def _ensure_segments(self):
+        if self._segments is None:
+            self._segments = list(self._collect_segments())
+
+    def _ensure_bins(self, level):
+        L = int(level)
+        if L in self._bins_per_level:
+            return
+        self._ensure_segments()
+        bs = self._level_bin_shape(L)
+        # === SLAB/CONE-VIEW SANDBOX BEGIN ========================================
+        # When `_pinned_level` is set, this adapter is one of the eight LOD-pinned
+        # virtual arrays exposed by _ZvAdapterStore for graph stores. Decimate the
+        # segment list by the deterministic hash _level_keep so a coarser pinned
+        # level holds ~1/2^K of the segments.
+        keep_level = self._pinned_level if self._pinned_level is not None else 0
+        # === SLAB/CONE-VIEW SANDBOX END ==========================================
+        bins: dict[tuple, list] = {}
+        for s in self._segments:
+            if not _level_keep(int(s.id), keep_level):
+                continue
+            pos = self._segment_position(s)
+            key = tuple(int(pos[d] // bs[d]) for d in range(self._ndim))
+            # The handler filters via `s.prominence == zv_level` (zarrvectors.py
+            # serve_spatial_chunk). For binning-only LOD where the same segment
+            # appears at every level, stamp prominence == L on the per-level
+            # copy so the filter always passes.
+            bin_seg = _Segment(
+                id=s.id, geometry=s.geometry, prominence=L,
+                properties=s.properties, relationships=s.relationships,
+            )
+            bins.setdefault(key, []).append(bin_seg)
+        self._bins_per_level[L] = bins
+
+    def read_bin(self, level, ix, iy, iz):
+        L = int(level)
+        if not (0 <= L < self.levels):
+            return iter(())
+        self._ensure_bins(L)
+        return iter(self._bins_per_level[L].get((int(ix), int(iy), int(iz)), ()))
+
+    def limit_per_level(self):
+        if self._limits is None:
+            limits: list[int] = []
+            for L in range(self.levels):
+                self._ensure_bins(L)
+                bins = self._bins_per_level[L]
+                m = max((len(v) for v in bins.values()), default=1)
+                limits.append(int(m))
+            self._limits = limits
+        return list(self._limits)
+
+
+class _PointArrayAdapter(_BaseArrayAdapter):
+    datatype = "point"
+
+    def __init__(self, zvr, level=0, name="points", pinned_level=None):
+        super().__init__(zvr, level, pinned_level=pinned_level)
+        self._name = name
+
+    def _segment_position(self, seg):
+        return seg.geometry  # (D,) for POINT
+
+    def _collect_segments(self):
+        from zarr_vectors.core.arrays import read_chunk_vertices
+        zvl = self._zvr[self._level_idx]
+        bound_min = self._bound_min.astype(np.float32)
+        out = []
+        next_id = 0
+        for ck in zvl.chunk_keys:
+            try:
+                groups = read_chunk_vertices(
+                    zvl._group, ck, dtype=np.float32, ndim=self._ndim,
+                )
+            except Exception as e:
+                LOG.warning("point adapter: skipping chunk %r: %s", ck, e)
+                continue
+            for vg in groups:
+                for v in vg:
+                    pos = np.asarray(v, dtype=np.float32) - bound_min
+                    next_id += 1
+                    # SLAB/CONE-VIEW SANDBOX: publish position as x/y/z
+                    # float32 properties for the behind-slice clipping shader.
+                    out.append(_Segment(
+                        id=next_id, geometry=pos.copy(), prominence=0,
+                        properties={
+                            "x": float(pos[0]),
+                            "y": float(pos[1]),
+                            "z": float(pos[2]),
+                        },
+                    ))
+        return out
+
+
+class _StreamlineArrayAdapter(_BaseArrayAdapter):
+    datatype = "streamline"
+
+    def __init__(self, zvr, level=0, name="lines", source="links", pinned_level=None):
+        """source: "links" (graph/skeleton edges + cross-chunk),
+                   "vg_pairs" (each vertex group is a 2-vertex line),
+                   "polylines" (read object manifests and explode N-vertex chains)."""
+        super().__init__(zvr, level, pinned_level=pinned_level)
+        self._name = name
+        self._source = source
+
+    def _segment_position(self, seg):
+        # geometry is (2, D); bin by midpoint
+        return (seg.geometry[0] + seg.geometry[1]) * 0.5
+
+    def _collect_segments(self):
+        if self._source == "links":
+            return self._collect_from_links()
+        if self._source == "vg_pairs":
+            return self._collect_from_vg_pairs()
+        if self._source == "polylines":
+            return self._collect_from_polylines()
+        raise ValueError(f"unknown streamline source {self._source!r}")
+
+    def _collect_from_links(self):
+        from zarr_vectors.core.arrays import (
+            read_chunk_vertices, read_chunk_links, read_cross_chunk_links,
+        )
+        out = []
+        zvl = self._zvr[self._level_idx]
+        bound_min = self._bound_min.astype(np.float32)
+        next_id = 0
+        chunk_vertices = {}
+        for ck in zvl.chunk_keys:
+            try:
+                groups = read_chunk_vertices(
+                    zvl._group, ck, dtype=np.float32, ndim=self._ndim,
+                )
+            except Exception:
+                continue
+            chunk_vertices[ck] = (
+                np.concatenate(groups, axis=0)
+                if groups else np.zeros((0, self._ndim), dtype=np.float32)
+            )
+        for ck, verts in chunk_vertices.items():
+            try:
+                link_groups = read_chunk_links(zvl._group, ck, link_width=2)
+            except Exception:
+                link_groups = []
+            for lg in link_groups:
+                for e in lg:
+                    a, b = int(e[0]), int(e[1])
+                    if not (0 <= a < len(verts)) or not (0 <= b < len(verts)):
+                        continue
+                    pa = verts[a].astype(np.float32) - bound_min
+                    pb = verts[b].astype(np.float32) - bound_min
+                    next_id += 1
+                    # SLAB/CONE-VIEW SANDBOX: properties = midpoint coords
+                    mid = (pa + pb) * 0.5
+                    out.append(_Segment(
+                        id=next_id, geometry=np.stack([pa, pb], axis=0),
+                        prominence=0,
+                        properties={
+                            "x": float(mid[0]),
+                            "y": float(mid[1]),
+                            "z": float(mid[2]),
+                        },
+                    ))
+        try:
+            ccl = read_cross_chunk_links(zvl._group)
+        except Exception:
+            ccl = []
+        for (ca, vi_a), (cb, vi_b) in ccl:
+            ca = tuple(int(x) for x in ca)
+            cb = tuple(int(x) for x in cb)
+            va = chunk_vertices.get(ca)
+            vb = chunk_vertices.get(cb)
+            if va is None or vb is None:
+                continue
+            if not (0 <= vi_a < len(va)) or not (0 <= vi_b < len(vb)):
+                continue
+            pa = va[vi_a].astype(np.float32) - bound_min
+            pb = vb[vi_b].astype(np.float32) - bound_min
+            next_id += 1
+            # SLAB/CONE-VIEW SANDBOX: properties = midpoint coords
+            mid = (pa + pb) * 0.5
+            out.append(_Segment(
+                id=next_id, geometry=np.stack([pa, pb], axis=0),
+                prominence=0,
+                properties={
+                    "x": float(mid[0]),
+                    "y": float(mid[1]),
+                    "z": float(mid[2]),
+                },
+            ))
+        return out
+
+    def _collect_from_vg_pairs(self):
+        from zarr_vectors.core.arrays import read_chunk_vertices
+        out = []
+        zvl = self._zvr[self._level_idx]
+        bound_min = self._bound_min.astype(np.float32)
+        next_id = 0
+        for ck in zvl.chunk_keys:
+            try:
+                groups = read_chunk_vertices(
+                    zvl._group, ck, dtype=np.float32, ndim=self._ndim,
+                )
+            except Exception:
+                continue
+            for vg in groups:
+                if len(vg) < 2:
+                    continue
+                pa = vg[0].astype(np.float32) - bound_min
+                pb = vg[1].astype(np.float32) - bound_min
+                next_id += 1
+                # SLAB/CONE-VIEW SANDBOX: properties = midpoint coords
+                mid = (pa + pb) * 0.5
+                out.append(_Segment(
+                    id=next_id, geometry=np.stack([pa, pb], axis=0),
+                    prominence=0,
+                    properties={
+                        "x": float(mid[0]),
+                        "y": float(mid[1]),
+                        "z": float(mid[2]),
+                    },
+                ))
+        return out
+
+    def _collect_from_polylines(self):
+        from zarr_vectors.core.arrays import (
+            read_all_object_manifests, read_object_vertices,
+        )
+        out = []
+        zvl = self._zvr[self._level_idx]
+        bound_min = self._bound_min.astype(np.float32)
+        try:
+            manifests = read_all_object_manifests(zvl._group)
+        except Exception as e:
+            LOG.warning("polyline adapter: cannot read object manifests: %s", e)
+            return out
+        next_id = 0
+        for obj_id in range(len(manifests)):
+            try:
+                groups = read_object_vertices(
+                    zvl._group, obj_id, dtype=np.float32, ndim=self._ndim,
+                )
+            except Exception:
+                continue
+            if not groups:
+                continue
+            verts = np.concatenate(groups, axis=0)
+            for i in range(len(verts) - 1):
+                pa = verts[i].astype(np.float32) - bound_min
+                pb = verts[i + 1].astype(np.float32) - bound_min
+                next_id += 1
+                # SLAB/CONE-VIEW SANDBOX: properties = midpoint coords
+                mid = (pa + pb) * 0.5
+                out.append(_Segment(
+                    id=next_id, geometry=np.stack([pa, pb], axis=0),
+                    prominence=0,
+                    properties={
+                        "x": float(mid[0]),
+                        "y": float(mid[1]),
+                        "z": float(mid[2]),
+                    },
+                ))
+        return out
+
+
+class _MeshArrayAdapter:
+    """V1 mesh adapter: best-effort. The notebook smoke test does not
+    exercise mesh stores, so this path is minimally validated. Refine
+    when a mesh-store smoke test exists."""
+
+    datatype = "mesh"
+
+    def __init__(self, zvr, level=0, name="mesh"):
+        self._zvr = zvr
+        self._level_idx = level
+        self._name = name
+        rm = zvr._meta
+        self._ndim = rm.sid_ndim
+        self._voxel_extent = _voxel_extent_from_bounds(rm.bounds)
+        self._segment_ids = None
+        self._mesh_cache = {}
+
+    @property
+    def voxel_extent(self):
+        return self._voxel_extent
+
+    @property
+    def affine(self):
+        return np.eye(4, dtype=np.float64)
+
+    @property
+    def levels(self):
+        return 1
+
+    @property
+    def segment_properties(self):
+        return []
+
+    def _load_segment_ids(self):
+        if self._segment_ids is not None:
+            return
+        from zarr_vectors.core.arrays import read_all_object_manifests
+        zvl = self._zvr[self._level_idx]
+        try:
+            manifests = read_all_object_manifests(zvl._group)
+            self._segment_ids = list(range(len(manifests)))
+        except Exception as e:
+            LOG.warning("mesh adapter: could not enumerate segment IDs: %s", e)
+            self._segment_ids = []
+
+    def iter_segment_ids(self):
+        self._load_segment_ids()
+        return iter(self._segment_ids)
+
+    def get_mesh(self, segment_id):
+        sid = int(segment_id)
+        if sid in self._mesh_cache:
+            return self._mesh_cache[sid]
+        from zarr_vectors.core.arrays import read_object_vertices
+        zvl = self._zvr[self._level_idx]
+        groups = read_object_vertices(
+            zvl._group, sid, dtype=np.float32, ndim=self._ndim,
+        )
+        if not groups:
+            raise KeyError(segment_id)
+        vertices = np.concatenate(groups, axis=0).astype(np.float32, copy=False)
+        # Triangle indices not yet wired; return an empty mesh so the
+        # handler can at least register the layer. Real mesh support needs
+        # the face-array convention nailed down against a real store.
+        indices = np.zeros((0, 3), dtype=np.uint32)
+        mesh = _MeshObj(vertices=vertices, indices=indices)
+        self._mesh_cache[sid] = mesh
+        return mesh
+
+
+class _ZvAdapterStore:
+    """Wraps a `zarr_vectors.lazy.store.ZVRStore` and exposes the
+    handler's expected `store.items()` / `store[name]` contract."""
+
+    def __init__(self, zvr):
+        self._zvr = zvr
+        self._geometry_types = list(zvr._meta.geometry_types)
+        self._arrays = self._build_arrays()
+
+    def _build_arrays(self):
+        gtype = self._geometry_types[0] if self._geometry_types else None
+        out = {}
+        if gtype in ("graph", "skeleton"):
+            # Single `nodes` (point) + single `edges` (streamline) layer per
+            # graph store. Each has the adapter's native 4-level binning LOD;
+            # Neuroglancer auto-selects the level based on screen-space pixel
+            # density. The earlier LOD-pinned variants were removed — the
+            # notebook driving this renders one of each layer.
+            out["nodes"] = _PointArrayAdapter(self._zvr, name="nodes")
+            out["edges"] = _StreamlineArrayAdapter(
+                self._zvr, name="edges", source="links",
+            )
+        elif gtype == "point_cloud":
+            out["points"] = _PointArrayAdapter(self._zvr, name="points")
+        elif gtype == "line":
+            out["lines"] = _StreamlineArrayAdapter(
+                self._zvr, name="lines", source="vg_pairs",
+            )
+        elif gtype in ("polyline", "streamline"):
+            out["polylines"] = _StreamlineArrayAdapter(
+                self._zvr, name="polylines", source="polylines",
+            )
+        elif gtype == "mesh":
+            out["mesh"] = _MeshArrayAdapter(self._zvr, name="mesh")
+        else:
+            LOG.warning(
+                "unsupported zarr_vectors geometry_type %r; "
+                "no virtual arrays exposed", gtype,
+            )
+        return out
+
+    def items(self):
+        return self._arrays.items()
+
+    def __getitem__(self, name):
+        return self._arrays[name]
+
+    def __iter__(self):
+        return iter(self._arrays)
+
+    def keys(self):
+        return self._arrays.keys()
+
+
+# =============================================================================
 # Store resolution hook
 # =============================================================================
 
@@ -636,12 +1244,15 @@ def set_open_store_hook(fn):
 
 
 def _default_open_store(protocol, store_path):
-    import zarrvectors
+    """Open a zarr_vectors store and wrap it in adapter classes that
+    expose the per-array interface this handler expects."""
+    from zarr_vectors.lazy.store import open_zvr
     if protocol == "file":
         full = store_path if store_path.startswith("/") else "/" + store_path
     else:
         full = f"{protocol}://{store_path}"
-    return zarrvectors.open(full)
+    zvr = open_zvr(full)
+    return _ZvAdapterStore(zvr)
 
 
 def _open_store(protocol, store_path):
@@ -1260,8 +1871,11 @@ def _build_source_url(fileserver_base, protocol, store_path, array_name, datatyp
     kind = _ZV_DATATYPE_TO_ROUTE_KIND.get(datatype)
     if kind is None:
         raise ValueError(f"unknown datatype {datatype!r}")
+    # Neuroglancer needs the `precomputed://` scheme prefix so it knows to
+    # fetch `/info` rather than probing for zarr / OCDBT manifest files.
     return (
-        fileserver_base.rstrip("/")
+        "precomputed://"
+        + fileserver_base.rstrip("/")
         + f"/zv/{kind}/{protocol}/{store_path}/@{array_name}"
     )
 
@@ -1282,6 +1896,12 @@ def _make_layer_spec(array, array_name, protocol, store_path,
         "datatype":        datatype,
         "affine":          np.asarray(array.affine, dtype=np.float64),
         "voxel_extent":    tuple(int(v) for v in array.voxel_extent),
+        # === SLAB/CONE-VIEW SANDBOX BEGIN ===================================
+        # Default annotation shader, picked by datatype. scene.py applies
+        # it on layer registration; the user can override via the layer
+        # Render tab without editing the package.
+        "default_shader":  _DEFAULT_SHADERS_BY_DATATYPE.get(datatype),
+        # === SLAB/CONE-VIEW SANDBOX END =====================================
         # Session 8: Scene.load passes these back to unregister_array_usage
         # when unloading. They identify exactly which refcount entry to drop.
         "_cache_identity": (protocol, store_path, array_name),
@@ -1390,6 +2010,7 @@ class _ZarrVectorsAnnotationHandlerBase(Handler):
                 )
             except ValueError as e:
                 return self._respond_404(str(e))
+            self.status = 200
             self.headers["Content-type"] = "application/json"
             self.body = json.dumps(info).encode()
             return None
@@ -1409,6 +2030,7 @@ class _ZarrVectorsAnnotationHandlerBase(Handler):
                     )
                 except ValueError as e:
                     return self._respond_404(str(e))
+                self.status = 200
                 self.headers["Content-type"] = "application/octet-stream"
                 self.body = body
                 return None
@@ -1425,6 +2047,7 @@ class _ZarrVectorsAnnotationHandlerBase(Handler):
                     return self._respond_404(f"segment {tail} not found")
                 except ValueError as e:
                     return self._respond_404(str(e))
+                self.status = 200
                 self.headers["Content-type"] = "application/octet-stream"
                 self.body = body
                 return None
@@ -1481,6 +2104,7 @@ class ZarrVectorsMeshHandler(Handler):
         kind, seg_id = _parse_mesh_resource(resource)
 
         if kind == "info":
+            self.status = 200
             self.headers["Content-type"] = "application/json"
             self.body = json.dumps(build_mesh_info(array)).encode()
             return None
@@ -1490,6 +2114,7 @@ class ZarrVectorsMeshHandler(Handler):
                 info = build_segment_properties_info(array)
             except ValueError as e:
                 return self._respond_404(str(e))
+            self.status = 200
             self.headers["Content-type"] = "application/json"
             self.body = json.dumps(info).encode()
             return None
@@ -1499,6 +2124,7 @@ class ZarrVectorsMeshHandler(Handler):
                 manifest = serve_mesh_manifest(array, seg_id)
             except KeyError:
                 return self._respond_404(f"segment {seg_id} not found")
+            self.status = 200
             self.headers["Content-type"] = "application/json"
             self.body = json.dumps(manifest).encode()
             return None
@@ -1513,6 +2139,7 @@ class ZarrVectorsMeshHandler(Handler):
                 return self._respond_404(f"segment {seg_id} not found")
             except ValueError as e:
                 return self._respond_404(str(e))
+            self.status = 200
             self.headers["Content-type"] = "application/octet-stream"
             self.body = body
             return None
